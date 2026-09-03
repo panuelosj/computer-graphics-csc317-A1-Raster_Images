@@ -1,0 +1,4 @@
+# desaturate_factor
+# shape (), dtype float64, range [0.25, 0.25]
+#
+0.25

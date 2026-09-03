@@ -1,0 +1,4 @@
+# hue_shift_deg
+# shape (), dtype float64, range [180, 180]
+#
+180.0

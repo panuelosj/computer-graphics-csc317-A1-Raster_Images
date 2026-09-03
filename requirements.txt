@@ -1,0 +1,9 @@
+# Dependencies for this assignment. Installed into ./venv by ./init.sh
+# (macOS/Linux) or .\init.ps1 (Windows).
+#
+# The same lightweight set is used by every assignment in the course, so one
+# environment works everywhere.
+numpy>=1.24
+pillow>=10.0
+scipy>=1.10
+polyscope>=2.2
