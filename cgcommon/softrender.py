@@ -43,9 +43,35 @@ def look_at_rotation(direction) -> np.ndarray:
     return np.stack([r, u, f])          # rows: right, up, forward
 
 
+def _sample_texture(tex, u, v, wrap=True):
+    """Bilinearly sample ``tex`` at coordinates ``u``, ``v`` in [0,1]."""
+    h, w = tex.shape[:2]
+    # .obj puts the texture origin bottom-left; images index from the top
+    y = (1.0 - np.asarray(v, dtype=float))
+    x = np.asarray(u, dtype=float)
+    if wrap:
+        x = np.mod(x, 1.0)
+        y = np.mod(y, 1.0)
+    else:
+        x = np.clip(x, 0.0, 1.0)
+        y = np.clip(y, 0.0, 1.0)
+    fx = x * (w - 1)
+    fy = y * (h - 1)
+    x0 = np.floor(fx).astype(np.int64)
+    y0 = np.floor(fy).astype(np.int64)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    tx = (fx - x0)[..., None]
+    ty = (fy - y0)[..., None]
+    top = tex[y0, x0] * (1 - tx) + tex[y0, x1] * tx
+    bot = tex[y1, x0] * (1 - tx) + tex[y1, x1] * tx
+    return top * (1 - ty) + bot * ty
+
+
 def render_mesh(V, F, colors, size=512, background=(0.02, 0.02, 0.03),
                 view=(0.0, 0.0, 1.0), margin=1.08, shade_backfaces=True,
-                center=None, extent=None, segments=None,
+                center=None, extent=None, uv=None, texture=None,
+                texture_wrap=True, segments=None,
                 segment_color=(1.0, 1.0, 1.0), segment_width=1.0,
                 segment_depth_test=False, overlays=None, supersample=1):
     """Rasterise a coloured mesh to an ``(size, size, 3)`` uint8 image.
@@ -63,6 +89,14 @@ def render_mesh(V, F, colors, size=512, background=(0.02, 0.02, 0.03),
         re-fitting itself: an auto-fitted camera silently zooms and pans from
         frame to frame, which turns an animation into a wobble. Use
         :func:`fit_camera` to compute values that hold for a whole sequence.
+    uv, texture : per-vertex texture coordinates ``(n,2)`` and an image as a
+        float ``(H,W,3)`` array in [0,1]. When both are given the *texture
+        coordinates* are what gets interpolated across each triangle and the
+        texture is sampled per pixel, so the result is as sharp as the image
+        rather than as coarse as the mesh. ``colors`` then acts as a per-vertex
+        shading multiplier on the sampled texel.
+    texture_wrap : tile the texture for coordinates outside [0,1] (the default)
+        instead of clamping to the edge.
     segments : ``(k,2,3)`` world-space line segments drawn over the mesh, or
         ``None``. Use :func:`box_segments` to turn bounding boxes into these
         and :func:`mesh_edges` for a mesh's own triangle edges.
@@ -85,7 +119,9 @@ def render_mesh(V, F, colors, size=512, background=(0.02, 0.02, 0.03),
         big = render_mesh(
             V, F, colors, size=size * ss, background=background, view=view,
             margin=margin, shade_backfaces=shade_backfaces, center=center,
-            extent=extent, segments=segments, segment_color=segment_color,
+            extent=extent, uv=uv, texture=texture,
+            texture_wrap=texture_wrap,
+            segments=segments, segment_color=segment_color,
             segment_width=segment_width * ss,
             segment_depth_test=segment_depth_test,
             overlays=[dict(o, width=o.get("width", 1.0) * ss)
@@ -100,6 +136,13 @@ def render_mesh(V, F, colors, size=512, background=(0.02, 0.02, 0.03),
     if C.ndim == 1:
         C = np.tile(C.reshape(1, 3), (V.shape[0], 1))
     C = np.clip(C, 0.0, 1.0)
+
+    tex = None
+    if texture is not None and uv is not None:
+        tex = np.asarray(texture, dtype=float)
+        if tex.dtype != np.float64 or tex.max() > 1.0:
+            tex = tex.astype(float) / (255.0 if tex.max() > 1.0 else 1.0)
+        UV = np.asarray(uv, dtype=float).reshape(-1, 2)
 
     # Orthographic camera: rotate the world so the view direction is +z.
     R = look_at_rotation(view)
@@ -171,6 +214,13 @@ def render_mesh(V, F, colors, size=512, background=(0.02, 0.02, 0.03),
 
         rgb = (w0[..., None] * C[i0] + w1[..., None] * C[i1]
                + w2[..., None] * C[i2])
+        if tex is not None:
+            # Interpolate the *texture coordinates* over the triangle, then
+            # look the texture up once per pixel. Interpolating the colour
+            # instead would cap the detail at one texel per vertex.
+            uu = w0 * UV[i0, 0] + w1 * UV[i1, 0] + w2 * UV[i2, 0]
+            vv = w0 * UV[i0, 1] + w1 * UV[i1, 1] + w2 * UV[i2, 1]
+            rgb = rgb * _sample_texture(tex, uu, vv, texture_wrap)
         sub_img = img[lo_y:hi_y + 1, lo_x:hi_x + 1]
         sub_img[visible] = np.clip(rgb[visible], 0.0, 1.0)
         sub_z[visible] = z[visible]
@@ -262,13 +312,28 @@ def box_segments(boxes) -> np.ndarray:
 
 
 def mesh_edges(V, F) -> np.ndarray:
-    """Every unique triangle edge of a mesh, as ``(k,2,3)`` segments."""
+    """Every unique polygon edge of a mesh, as ``(k,2,3)`` segments.
+
+    Faces are used exactly as given: a quad contributes its four sides and
+    *not* the diagonal that triangulating it would introduce, so a quad cage
+    (a subdivision control mesh, say) draws as the quad cage it is. For a
+    triangle mesh this is the same set of edges as before.
+    """
     V = np.asarray(V, dtype=float)
-    tris = _as_triangles(F)
-    if tris.size == 0:
+    F = np.asarray(F)
+    if F.size == 0:
         return np.zeros((0, 2, 3), dtype=float)
-    pairs = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
-    pairs = np.unique(np.sort(pairs, axis=1), axis=0)
+    if F.ndim == 2:
+        k = F.shape[1]
+        pairs = np.concatenate(
+            [np.stack([F[:, i], F[:, (i + 1) % k]], axis=1) for i in range(k)])
+    else:                                   # ragged: mixed polygon sizes
+        acc = []
+        for face in F:
+            idx = [int(i) for i in np.asarray(face).ravel()]
+            acc += [[idx[i], idx[(i + 1) % len(idx)]] for i in range(len(idx))]
+        pairs = np.asarray(acc, dtype=int)
+    pairs = np.unique(np.sort(pairs.astype(int), axis=1), axis=0)
     return np.stack([V[pairs[:, 0]], V[pairs[:, 1]]], axis=1)
 
 

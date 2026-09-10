@@ -58,6 +58,14 @@ source venv/bin/activate           # macOS / Linux
 # .\venv\Scripts\Activate.ps1      # Windows
 ```
 
+On Windows, PowerShell may refuse to run `init.ps1` or `Activate.ps1` under
+its default execution policy. If so, allow scripts for the current session
+only and try again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
 Each assignment has its own `venv`, so activate the one belonging to the
 assignment you are working on.
 
